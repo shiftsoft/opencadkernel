@@ -1573,14 +1573,26 @@ fn solid_isoline_values(
         | (Surface::Torus(_), _) => {
             let turn = std::f64::consts::TAU;
             if span >= turn - 1e-9 {
+                // AutoCAD starts half a turn from the surface's zero angle:
+                // with ISOLINES 5 a sphere whose zero angle is +X has its
+                // first line toward -X (measured on spheres, tori and cones
+                // for n from 2 to 30; an even n draws the same set either way).
                 (0..count)
                     .map(|index| {
-                        range[0] + (turn * index as f64 / count as f64 - range[0]).rem_euclid(turn)
+                        let angle = std::f64::consts::PI + turn * index as f64 / count as f64;
+                        range[0] + (angle - range[0]).rem_euclid(turn)
                     })
                     .collect()
             } else {
                 pieces((count as f64 * span / turn + 0.5).floor() as usize + 1)
             }
+        }
+        // AutoCAD cuts a whole sphere's latitude into 2⌈2n/5⌉ equal pieces
+        // for ISOLINES n (measured for n from 2 to 30: 4 gives 45°, 12 gives
+        // 18°, 30 gives 7.5°), not n; the equator is always one of the lines.
+        // A face over part of the latitude keeps n pieces.
+        (Surface::Sphere(_), _) if span >= std::f64::consts::PI - 1e-9 => {
+            pieces(2 * (2 * count).div_ceil(5))
         }
         (Surface::Sphere(_), _) => pieces(count),
         (Surface::Cylinder(_) | Surface::Cone(_), _) => Vec::new(),
