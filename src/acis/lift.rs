@@ -951,7 +951,10 @@ impl EllipticCone {
         let points = section.iter().map(|&(x, y, _)| vec![at(x, y, low), at(x, y, high)]).collect();
         let weights = section.iter().map(|&(_, _, w)| vec![w, w]).collect();
         let knots = vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0];
+        // ACIS measures the section's angle from the major axis, which
+        // AutoCAD places the surface's isolines by.
         NurbsSurface3::new(2, 1, points, knots, vec![0.0, 0.0, 1.0, 1.0], Some(weights))
+            .map(NurbsSurface3::with_angular_u)
     }
 }
 

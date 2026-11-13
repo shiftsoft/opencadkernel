@@ -956,6 +956,9 @@ pub struct NurbsSurface3 {
     u_closed: bool,
     v_closed: bool,
     v_reversed: bool,
+    /// `u` is a whole turn of an ellipse in four rational quarters standing
+    /// for an angle (see [`NurbsSurface3::with_angular_u`]).
+    angular_u: bool,
     samples: Samples,
 }
 
@@ -1042,6 +1045,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            angular_u: false,
             samples: Samples::default(),
         })
     }
@@ -1158,6 +1162,7 @@ impl NurbsSurface3 {
             u_closed,
             v_closed,
             v_reversed: false,
+            angular_u: false,
             samples: Samples::default(),
         })
     }
@@ -1176,6 +1181,56 @@ impl NurbsSurface3 {
 
     pub fn v_reversed(&self) -> bool {
         self.v_reversed
+    }
+
+    /// Marks `u` as standing for an angle: the surface is an analytic one
+    /// (an elliptical cone or cylinder) written as a rational quadratic
+    /// ellipse in four quarter spans of `u`, from the major axis toward the
+    /// minor, whose own parameter is the ellipse's angle. Knots and points
+    /// are unchanged; only where an angle falls in `u` is read from it (see
+    /// [`NurbsSurface3::u_at_angle`]).
+    pub fn with_angular_u(mut self) -> Self {
+        self.angular_u = true;
+        self
+    }
+
+    /// Whether `u` stands for an angle (see [`NurbsSurface3::with_angular_u`]).
+    pub fn angular_u(&self) -> bool {
+        self.angular_u
+    }
+
+    /// The `u` of the ellipse's `angle` (radians from the major axis toward
+    /// the minor) on a surface whose `u` stands for an angle: each quarter
+    /// turn is one rational quadratic span with weights 1, √½, 1, whose
+    /// parameter is not the angle but runs with it. `None` when `u` does not
+    /// stand for an angle.
+    pub fn u_at_angle(&self, angle: f64) -> Option<f64> {
+        if !self.angular_u {
+            return None;
+        }
+        let ((start, end), _) = self.domain();
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let turn = angle.rem_euclid(4.0 * quarter);
+        let index = (turn / quarter).floor().min(3.0);
+        let within = turn - index * quarter;
+        // The span's point at `s` lies at the angle whose tangent is y / x;
+        // the angle grows with `s` from 0 to a quarter turn.
+        let weight = std::f64::consts::FRAC_1_SQRT_2;
+        let angle_at = |s: f64| {
+            let x = (1.0 - s) * (1.0 - s) + 2.0 * weight * s * (1.0 - s);
+            let y = s * s + 2.0 * weight * s * (1.0 - s);
+            y.atan2(x)
+        };
+        let (mut low, mut high) = (0.0_f64, 1.0_f64);
+        for _ in 0..60 {
+            let middle = 0.5 * (low + high);
+            if angle_at(middle) < within {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        Some(start + (end - start) * (index + 0.5 * (low + high)) / 4.0)
     }
 
     pub fn periodicity(&self) -> [bool; 2] {
@@ -1560,6 +1615,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_angle_falls_in_u_where_the_rational_ellipse_reaches_it() {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let ring = [
+            (1.0, 0.0, 1.0), (1.0, 1.0, w), (0.0, 1.0, 1.0), (-1.0, 1.0, w), (-1.0, 0.0, 1.0),
+            (-1.0, -1.0, w), (0.0, -1.0, 1.0), (1.0, -1.0, w), (1.0, 0.0, 1.0),
+        ];
+        // An ellipse 4 by 2, swept up by 1.
+        let net = ring.iter().map(|&(x, y, _)| vec![[4.0 * x, 2.0 * y, 0.0], [4.0 * x, 2.0 * y, 1.0]]).collect();
+        let weights = ring.iter().map(|&(_, _, w)| vec![w, w]).collect();
+        let knots = vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0];
+        let plain = NurbsSurface3::new(2, 1, net, knots, vec![0.0, 0.0, 1.0, 1.0], Some(weights)).unwrap();
+        assert_eq!(plain.u_at_angle(1.0), None);
+        let surface = plain.with_angular_u();
+        for angle in [0.0, 0.3, 1.0, 1.5707963267948966, 2.0, 3.5, 5.9, -0.4] {
+            let u = surface.u_at_angle(angle).unwrap();
+            let point = surface.point_at_knot(u, 0.0);
+            // The ellipse's angle, not the point's: x = 4 cos, y = 2 sin.
+            let found = (point[1] / 2.0).atan2(point[0] / 4.0);
+            let gap = (found - angle).rem_euclid(std::f64::consts::TAU);
+            assert!(gap.min(std::f64::consts::TAU - gap) < 1e-12, "{angle}: {found} at u {u}");
+        }
+    }
 
     #[test]
     fn a_point_just_short_of_a_clamped_loops_end_projects_there() {

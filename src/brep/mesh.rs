@@ -278,6 +278,7 @@ pub struct TessellationTolerance {
     isolines: [usize; 2],
     planar_isolines: bool,
     solid_isolines: bool,
+    seam_edges: bool,
     triangle_budget: Option<usize>,
 }
 
@@ -290,6 +291,7 @@ impl TessellationTolerance {
             isolines: [0; 2],
             planar_isolines: false,
             solid_isolines: false,
+            seam_edges: false,
             triangle_budget: None,
         }
     }
@@ -343,6 +345,15 @@ impl TessellationTolerance {
     /// grid to expose their construction parameters.
     pub fn with_planar_isolines(mut self, enabled: bool) -> Self {
         self.planar_isolines = enabled;
+        self
+    }
+
+    /// Draw the edges a face meets itself along (the seam a revolved or
+    /// swept surface's profile leaves where its turn closes) among the
+    /// drawing edges, as AutoCAD draws a SURFACE entity's. Off by default,
+    /// where such an edge is a parameter seam and not a crease.
+    pub fn with_seam_edges(mut self, enabled: bool) -> Self {
+        self.seam_edges = enabled;
         self
     }
 }
@@ -1022,7 +1033,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
             None => out.missing_faces.push(face_key),
         }
     }
-    out.drawing_edges = scheduled_edges(body, &schedules);
+    out.drawing_edges = scheduled_edges(body, &schedules, tolerance.seam_edges);
     out.edges = out
         .drawing_edges
         .iter()
@@ -1111,7 +1122,7 @@ pub fn tessellate_wireframe(body: &Body, tolerance: TessellationTolerance) -> Bo
             }
         }
     }
-    out.edges = visible_scheduled_edges(body, &schedules);
+    out.edges = visible_scheduled_edges(body, &schedules, tolerance.seam_edges);
     out
 }
 
@@ -1279,13 +1290,16 @@ fn edge_schedules(
 fn visible_scheduled_edges(
     body: &Body,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    seam_edges: bool,
 ) -> Vec<EdgeMesh> {
-    scheduled_edges(body, schedules)
+    scheduled_edges(body, schedules, seam_edges)
         .into_iter()
         .filter(|edge| {
-            schedules
-                .get(&edge.edge)
-                .is_none_or(|schedule| !smooth_scheduled_edge(body, edge.edge, schedule))
+            // A seam is smooth by nature: drawn, it is kept.
+            (seam_edges && topological_parameter_seam(body, edge.edge))
+                || schedules
+                    .get(&edge.edge)
+                    .is_none_or(|schedule| !smooth_scheduled_edge(body, edge.edge, schedule))
         })
         .collect()
 }
@@ -1293,9 +1307,10 @@ fn visible_scheduled_edges(
 fn scheduled_edges(
     body: &Body,
     schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    seam_edges: bool,
 ) -> Vec<EdgeMesh> {
     body.edge_keys()
-        .filter(|edge| !topological_parameter_seam(body, *edge))
+        .filter(|edge| seam_edges || !topological_parameter_seam(body, *edge))
         .filter_map(|edge| {
             let schedule = schedules.get(&edge)?;
             (schedule.len() >= 2).then(|| EdgeMesh {
@@ -1508,12 +1523,13 @@ fn face_isolines(
         let values = if solid_isolines {
             solid_isoline_values(surface, fixed_axis, bounds[fixed_axis], count)
         } else {
-            (0..count)
-                .map(|index| {
-                    bounds[fixed_axis][0]
-                        + fixed_span * (index as f64 + 1.0) / (count as f64 + 1.0)
-                })
-                .collect()
+            surface_isoline_values(
+                surface,
+                !face_has_seam(body, face),
+                fixed_axis,
+                bounds[fixed_axis],
+                count,
+            )
         };
         for fixed in values {
             for interval in line_intervals(&parameters, fixed_axis, fixed) {
@@ -1551,6 +1567,109 @@ fn face_isolines(
         }
     }
     Some(out)
+}
+
+/// Where a surface draws its `count` lines (its own U or V count) fixing
+/// `axis` of a face spanning `range`, as AutoCAD draws a SURFACE entity.
+///
+/// A turn round a cylinder, a cone or a closed spline that the face goes all
+/// the way round without a seam edge (a loft between closed sections) is cut
+/// into `count` equal pieces, the lines at `count` angles a whole turn over
+/// `count` apart: from the surface's zero angle on a cylinder, from half a
+/// turn round it on a cone (as a solid's are). An elliptical cylinder's or
+/// cone's turn is its angle, not its rational `u` (see
+/// [`NurbsSurface3::u_at_angle`]). Measured with 3 and 6 lines on lofts
+/// between two equal coaxial circles (a cylinder: 3 lines at 0°, 120° and
+/// 240°) and between a circle and a smaller one moved aside (an elliptical
+/// cone: 3 lines at 180°, 300° and 60°); a closed spline that is neither is
+/// taken as a cone.
+///
+/// Any other direction, a turn that the face's seam edge opens (a revolved
+/// or swept surface, whose profile is that edge) included, is cut into
+/// `count` + 1 equal pieces of the face's range.
+///
+/// [`NurbsSurface3::u_at_angle`]: crate::space::nurbs::NurbsSurface3::u_at_angle
+fn surface_isoline_values(
+    surface: &super::geometry::Surface,
+    seamless: bool,
+    axis: usize,
+    range: [f64; 2],
+    count: usize,
+) -> Vec<f64> {
+    use super::geometry::Surface;
+    let span = range[1] - range[0];
+    let turn = std::f64::consts::TAU;
+    let angle = |cylinder: bool, index: usize| {
+        let start = if cylinder { 0.0 } else { std::f64::consts::PI };
+        start + turn * index as f64 / count as f64
+    };
+    match surface {
+        Surface::Cylinder(_) | Surface::Cone(_) if seamless && axis == 0 && span >= turn - 1e-9 => {
+            let cylinder = matches!(surface, Surface::Cylinder(_));
+            return (0..count)
+                .map(|index| range[0] + (angle(cylinder, index) - range[0]).rem_euclid(turn))
+                .collect();
+        }
+        Surface::Nurbs(spline) if seamless && spline.periodicity()[axis] => {
+            let (u, v) = spline.domain();
+            let (start, end) = if axis == 0 { u } else { v };
+            let period = end - start;
+            if span >= period - 1e-9 {
+                let cylinder = axis == 0 && spline.angular_u() && unscaled_section(spline);
+                return (0..count)
+                    .map(|index| {
+                        let value = match spline.u_at_angle(angle(cylinder, index)) {
+                            Some(value) if axis == 0 => value,
+                            _ => start + period * (0.5 + index as f64 / count as f64),
+                        };
+                        range[0] + (value - range[0]).rem_euclid(period)
+                    })
+                    .collect();
+            }
+        }
+        _ => {}
+    }
+    (0..count)
+        .map(|index| range[0] + span * (index as f64 + 1.0) / (count as f64 + 1.0))
+        .collect()
+}
+
+/// Whether a spline whose `u` stands for an angle keeps the size of its
+/// section along `v`: an elliptical cylinder rather than a cone.
+fn unscaled_section(spline: &crate::space::nurbs::NurbsSurface3) -> bool {
+    let net = spline.control_points();
+    let width = |column: usize| -> Option<f64> {
+        let (first, half) = (net.first()?.get(column)?, net.get(net.len() / 2)?.get(column)?);
+        Some(Vec3::from(*first).distance(Vec3::from(*half)))
+    };
+    let columns = net.first().map_or(0, Vec::len);
+    match (width(0), width(columns.saturating_sub(1))) {
+        (Some(low), Some(high)) => (low - high).abs() <= 1e-9 * low.max(high).max(1.0),
+        _ => false,
+    }
+}
+
+/// Whether some edge bounds `face` on both of its sides: the seam a
+/// revolved surface's profile leaves where its turn closes.
+fn face_has_seam(body: &Body, face: FaceKey) -> bool {
+    let Some(node) = body.faces.get(face) else {
+        return false;
+    };
+    let mut edges = Vec::new();
+    for loop_key in &node.loops {
+        let Some(ring) = body.loops.get(*loop_key) else {
+            continue;
+        };
+        for coedge_key in &ring.coedges {
+            if let Some(coedge) = body.coedges.get(*coedge_key) {
+                if edges.contains(&coedge.edge) {
+                    return true;
+                }
+                edges.push(coedge.edge);
+            }
+        }
+    }
+    false
 }
 
 /// Where a solid draws its `count` construction lines fixing `axis` of a
@@ -6691,6 +6810,38 @@ mod tests {
             .len(),
             12,
         );
+    }
+
+    #[test]
+    fn a_seamless_surface_turn_starts_at_a_cylinders_zero_and_half_round_a_cones() {
+        use crate::brep::geometry::Cone;
+        use std::f64::consts::{PI, TAU};
+        let base = Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        let cylinder = Surface::Cylinder(Cylinder { base, radius: 5.0 });
+        let cone = Surface::Cone(Cone { base, radius: 5.0, half_angle: 0.2 });
+        let close = |found: Vec<f64>, wanted: &[f64]| {
+            assert_eq!(found.len(), wanted.len(), "{found:?}");
+            for (found, wanted) in found.iter().zip(wanted) {
+                assert!((found - wanted).abs() < 1e-12, "{found} for {wanted}");
+            }
+        };
+        close(surface_isoline_values(&cylinder, true, 0, [0.0, TAU], 3), &[0.0, TAU / 3.0, 2.0 * TAU / 3.0]);
+        close(surface_isoline_values(&cone, true, 0, [0.0, TAU], 3), &[PI, PI + TAU / 3.0, PI - TAU / 3.0]);
+        // A seam opens the turn: n + 1 pieces of the face's range, as along it.
+        close(surface_isoline_values(&cone, false, 0, [0.0, TAU], 3), &[TAU / 4.0, TAU / 2.0, 3.0 * TAU / 4.0]);
+        close(surface_isoline_values(&cylinder, true, 1, [0.0, 10.0], 4), &[2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn a_surface_draws_its_seam_edge_when_asked() {
+        let solid = crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap();
+        let tolerance = TessellationTolerance::new(default_angle(), TOL);
+        let without = tessellate_wireframe(&solid, tolerance).edges;
+        let with = tessellate_wireframe(&solid, tolerance.with_seam_edges(true)).edges;
+        assert_eq!(with.len(), without.len() + 1);
+        let seam = with.iter().find(|edge| !without.iter().any(|other| other.edge == edge.edge)).unwrap();
+        let (first, last) = (seam.positions.first().unwrap(), seam.positions.last().unwrap());
+        assert!((last[2] - first[2]).abs() > 9.9, "the seam runs up the side");
     }
 
     #[test]
