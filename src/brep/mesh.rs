@@ -1575,14 +1575,13 @@ fn face_isolines(
 /// A turn round a cylinder, a cone or a closed spline that the face goes all
 /// the way round without a seam edge (a loft between closed sections) is cut
 /// into `count` equal pieces, the lines at `count` angles a whole turn over
-/// `count` apart: from the surface's zero angle on a cylinder, from half a
-/// turn round it on a cone (as a solid's are). An elliptical cylinder's or
-/// cone's turn is its angle, not its rational `u` (see
-/// [`NurbsSurface3::u_at_angle`]). Measured with 3 and 6 lines on lofts
-/// between two equal coaxial circles (a cylinder: 3 lines at 0°, 120° and
-/// 240°) and between a circle and a smaller one moved aside (an elliptical
-/// cone: 3 lines at 180°, 300° and 60°); a closed spline that is neither is
-/// taken as a cone.
+/// `count` apart: from the surface's zero angle on a circular cylinder or
+/// cone, from half a turn round it on an elliptical one, whose turn is its
+/// angle, not its rational `u` (see [`NurbsSurface3::u_at_angle`]). Measured
+/// with 3 and 6 lines on lofts between circles: coaxial ones (a cylinder and
+/// a cone, 3 lines at 0°, 120° and 240° from the zero) and ones moved aside
+/// (an elliptical cylinder and two elliptical cones, 3 lines at 180°, 300°
+/// and 60°). Any other closed spline is taken as the elliptical ones.
 ///
 /// Any other direction, a turn that the face's seam edge opens (a revolved
 /// or swept surface, whose profile is that edge) included, is cut into
@@ -1599,15 +1598,11 @@ fn surface_isoline_values(
     use super::geometry::Surface;
     let span = range[1] - range[0];
     let turn = std::f64::consts::TAU;
-    let angle = |cylinder: bool, index: usize| {
-        let start = if cylinder { 0.0 } else { std::f64::consts::PI };
-        start + turn * index as f64 / count as f64
-    };
+    let step = |index: usize| turn * index as f64 / count as f64;
     match surface {
         Surface::Cylinder(_) | Surface::Cone(_) if seamless && axis == 0 && span >= turn - 1e-9 => {
-            let cylinder = matches!(surface, Surface::Cylinder(_));
             return (0..count)
-                .map(|index| range[0] + (angle(cylinder, index) - range[0]).rem_euclid(turn))
+                .map(|index| range[0] + (step(index) - range[0]).rem_euclid(turn))
                 .collect();
         }
         Surface::Nurbs(spline) if seamless && spline.periodicity()[axis] => {
@@ -1615,10 +1610,9 @@ fn surface_isoline_values(
             let (start, end) = if axis == 0 { u } else { v };
             let period = end - start;
             if span >= period - 1e-9 {
-                let cylinder = axis == 0 && spline.angular_u() && unscaled_section(spline);
                 return (0..count)
                     .map(|index| {
-                        let value = match spline.u_at_angle(angle(cylinder, index)) {
+                        let value = match spline.u_at_angle(std::f64::consts::PI + step(index)) {
                             Some(value) if axis == 0 => value,
                             _ => start + period * (0.5 + index as f64 / count as f64),
                         };
@@ -1632,21 +1626,6 @@ fn surface_isoline_values(
     (0..count)
         .map(|index| range[0] + span * (index as f64 + 1.0) / (count as f64 + 1.0))
         .collect()
-}
-
-/// Whether a spline whose `u` stands for an angle keeps the size of its
-/// section along `v`: an elliptical cylinder rather than a cone.
-fn unscaled_section(spline: &crate::space::nurbs::NurbsSurface3) -> bool {
-    let net = spline.control_points();
-    let width = |column: usize| -> Option<f64> {
-        let (first, half) = (net.first()?.get(column)?, net.get(net.len() / 2)?.get(column)?);
-        Some(Vec3::from(*first).distance(Vec3::from(*half)))
-    };
-    let columns = net.first().map_or(0, Vec::len);
-    match (width(0), width(columns.saturating_sub(1))) {
-        (Some(low), Some(high)) => (low - high).abs() <= 1e-9 * low.max(high).max(1.0),
-        _ => false,
-    }
 }
 
 /// Whether some edge bounds `face` on both of its sides: the seam a
@@ -1696,9 +1675,17 @@ fn solid_isoline_values(
                 // with ISOLINES 5 a sphere whose zero angle is +X has its
                 // first line toward -X (measured on spheres, tori and cones
                 // for n from 2 to 30; an even n draws the same set either way).
+                // A cylinder's lines start at its zero angle instead (ISOLINES
+                // 3, surfaces-loft-4); listed from the one nearest half a turn,
+                // an even count gives the very lines it always did.
+                let cylinder = matches!(surface, Surface::Cylinder(_));
                 (0..count)
                     .map(|index| {
-                        let angle = std::f64::consts::PI + turn * index as f64 / count as f64;
+                        let angle = if cylinder {
+                            turn * (index + count / 2) as f64 / count as f64
+                        } else {
+                            std::f64::consts::PI + turn * index as f64 / count as f64
+                        };
                         range[0] + (angle - range[0]).rem_euclid(turn)
                     })
                     .collect()
@@ -6813,9 +6800,9 @@ mod tests {
     }
 
     #[test]
-    fn a_seamless_surface_turn_starts_at_a_cylinders_zero_and_half_round_a_cones() {
+    fn a_seamless_surface_turn_starts_at_a_circular_cylinders_or_cones_zero() {
         use crate::brep::geometry::Cone;
-        use std::f64::consts::{PI, TAU};
+        use std::f64::consts::TAU;
         let base = Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
         let cylinder = Surface::Cylinder(Cylinder { base, radius: 5.0 });
         let cone = Surface::Cone(Cone { base, radius: 5.0, half_angle: 0.2 });
@@ -6826,10 +6813,14 @@ mod tests {
             }
         };
         close(surface_isoline_values(&cylinder, true, 0, [0.0, TAU], 3), &[0.0, TAU / 3.0, 2.0 * TAU / 3.0]);
-        close(surface_isoline_values(&cone, true, 0, [0.0, TAU], 3), &[PI, PI + TAU / 3.0, PI - TAU / 3.0]);
+        close(surface_isoline_values(&cone, true, 0, [0.0, TAU], 3), &[0.0, TAU / 3.0, 2.0 * TAU / 3.0]);
         // A seam opens the turn: n + 1 pieces of the face's range, as along it.
         close(surface_isoline_values(&cone, false, 0, [0.0, TAU], 3), &[TAU / 4.0, TAU / 2.0, 3.0 * TAU / 4.0]);
         close(surface_isoline_values(&cylinder, true, 1, [0.0, 10.0], 4), &[2.0, 4.0, 6.0, 8.0]);
+        // A solid's cylinder starts at its zero too, its cone half a turn round.
+        close(solid_isoline_values(&cylinder, 0, [0.0, TAU], 3), &[TAU / 3.0, 2.0 * TAU / 3.0, 0.0]);
+        let half = std::f64::consts::PI;
+        close(solid_isoline_values(&cone, 0, [0.0, TAU], 3), &[half, half + TAU / 3.0, half - TAU / 3.0]);
     }
 
     #[test]
